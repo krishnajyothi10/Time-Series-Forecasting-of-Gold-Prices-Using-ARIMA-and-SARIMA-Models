@@ -31,9 +31,7 @@ st.write("Data source: Kaggle (downloaded automatically using kagglehub)")
 # Download dataset using kagglehub
 # ----------------------------
 with st.spinner("Downloading dataset from Kaggle using kagglehub..."):
-    path = kagglehub.dataset_download(
-        "limbaddd/gold-price-predictions"
-    )
+    path = kagglehub.dataset_download("limbaddd/gold-price-predictions")
 
 st.success("Dataset downloaded successfully!")
 st.write("📁 Dataset path:", path)
@@ -54,17 +52,61 @@ st.subheader("Raw Dataset Preview")
 st.dataframe(df.head())
 
 # ----------------------------
-# Detect Date & Target columns
+# Detect Date & Target columns (safer)
 # ----------------------------
-date_col = [c for c in df.columns if "date" in c.lower()][0]
-price_col = [c for c in df.columns if "close" in c.lower() or "price" in c.lower()][0]
+date_candidates = [c for c in df.columns if "date" in c.lower() or "time" in c.lower()]
+if not date_candidates:
+    st.error("No Date column found. Please ensure the dataset has a Date/Time column.")
+    st.stop()
+date_col = date_candidates[0]
 
-df[date_col] = pd.to_datetime(df[date_col])
-df = df.sort_values(date_col)
+price_candidates = [c for c in df.columns if ("close" in c.lower()) or ("price" in c.lower())]
+if not price_candidates:
+    # fallback: pick first numeric column
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if not num_cols:
+        st.error("No numeric price column found for forecasting.")
+        st.stop()
+    price_col = num_cols[0]
+else:
+    price_col = price_candidates[0]
+
+st.write(f"✅ Detected Date column: **{date_col}**")
+st.write(f"✅ Detected Price column: **{price_col}**")
+
+# Parse dates safely
+df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+df = df.dropna(subset=[date_col]).sort_values(date_col)
 df.set_index(date_col, inplace=True)
 
+# ----------------------------
+# Build time series + CLEANING (CRITICAL FIX)
+# ----------------------------
 ts = df[price_col].copy()
+
+# Convert strings like "1,234.56" to numeric
+if ts.dtype == "object":
+    ts = ts.astype(str).str.replace(",", "", regex=False)
+
+ts = pd.to_numeric(ts, errors="coerce")
+
+# Remove invalid values
+ts = ts.replace([np.inf, -np.inf], np.nan)
+ts = ts.dropna()
+
+# Remove duplicate timestamps if any
+ts = ts[~ts.index.duplicated(keep="last")]
+
+# Fill any remaining gaps (optional safety)
 ts = ts.ffill().bfill()
+
+# Final safety check
+if ts.empty or len(ts) < 30:
+    st.error("Time series is empty or too short after cleaning. Cannot proceed.")
+    st.stop()
+
+st.write(f"📌 Final cleaned series length: **{len(ts)}**")
+st.write(f"📌 Series dtype: **{ts.dtype}**")
 
 # ----------------------------
 # Plot time series
@@ -81,29 +123,50 @@ ax.legend()
 st.pyplot(fig)
 
 # ----------------------------
-# Stationarity Test
+# Stationarity Test (FIXED)
 # ----------------------------
 st.subheader("Stationarity Test (ADF)")
 
-adf_stat, p_value, _, _, _, _ = adfuller(ts)
-st.write(f"ADF Statistic: **{adf_stat:.4f}**")
-st.write(f"p-value: **{p_value:.6f}**")
+try:
+    adf_result = adfuller(ts.dropna())
+    adf_stat = adf_result[0]
+    p_value = adf_result[1]
 
-if p_value < 0.05:
-    st.success("Series is stationary")
-else:
-    st.warning("Series is non-stationary (differencing required)")
+    st.write(f"ADF Statistic: **{adf_stat:.4f}**")
+    st.write(f"p-value: **{p_value:.6f}**")
+
+    if p_value < 0.05:
+        st.success("Series is stationary (reject unit root at 5% level)")
+    else:
+        st.warning("Series is non-stationary (differencing required)")
+except Exception as e:
+    st.error("ADF test failed due to invalid series values.")
+    st.write("Error details:", str(e))
+    st.stop()
 
 # ----------------------------
 # Train-Test Split
 # ----------------------------
 split = int(len(ts) * 0.8)
-train = ts[:split]
-test = ts[split:]
+train = ts.iloc[:split]
+test = ts.iloc[split:]
 
-# Log transform
-train_log = np.log(train)
-test_log = np.log(test)
+if len(train) < 20 or len(test) < 5:
+    st.error("Not enough data points after split to train/test the model.")
+    st.stop()
+
+# ----------------------------
+# Safe log transform (FIXED)
+# ----------------------------
+# Log requires positive values. If there are zeros/negatives, shift the series.
+min_val = min(train.min(), test.min())
+shift = 0.0
+if min_val <= 0:
+    shift = abs(min_val) + 1e-6  # tiny epsilon
+    st.warning(f"⚠️ Non-positive values detected. Applying shift of {shift:.6f} before log transform.")
+
+train_log = np.log(train + shift)
+test_log = np.log(test + shift)
 
 # ----------------------------
 # ARIMA Model
@@ -115,7 +178,8 @@ with st.spinner("Training ARIMA model..."):
         train_log,
         seasonal=False,
         stepwise=True,
-        suppress_warnings=True
+        suppress_warnings=True,
+        error_action="ignore"
     )
 
 st.write("Selected ARIMA Model:")
@@ -125,7 +189,10 @@ st.write(model)
 # Forecast on Test Data
 # ----------------------------
 forecast_log = model.predict(n_periods=len(test_log))
-forecast = np.exp(forecast_log)
+forecast = np.exp(forecast_log) - shift  # reverse shift
+
+# Ensure forecast aligns with test index
+forecast = pd.Series(forecast, index=test.index)
 
 # ----------------------------
 # Evaluation
@@ -145,7 +212,7 @@ st.subheader("Forecast vs Actual")
 fig, ax = plt.subplots(figsize=(10, 4))
 ax.plot(train, label="Train")
 ax.plot(test, label="Test")
-ax.plot(test.index, forecast, label="Forecast")
+ax.plot(forecast.index, forecast.values, label="Forecast")
 ax.set_title("ARIMA Forecast")
 ax.set_xlabel("Date")
 ax.set_ylabel("Gold Price")
@@ -162,7 +229,7 @@ future_days = st.slider("Select number of days to forecast", 7, 60, 30)
 
 with st.spinner("Forecasting future prices..."):
     future_log = model.predict(n_periods=future_days)
-    future_prices = np.exp(future_log)
+    future_prices = np.exp(future_log) - shift
 
 future_dates = pd.date_range(
     start=ts.index.max() + pd.Timedelta(days=1),
