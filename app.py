@@ -156,16 +156,17 @@ st.subheader("ARIMA Model Fitting")
 
 with st.spinner("Training ARIMA model (Auto-ARIMA)..."):
     model = auto_arima(
-        train,
-        seasonal=False,
-        stepwise=True,
-        suppress_warnings=True,
-        error_action="ignore",
-        max_p=max_p,
-        max_q=max_q,
-        max_d=max_d,
-        information_criterion="aic"
-    )
+    train,
+    seasonal=False,
+    d=1,              # ✅ FORCE first differencing
+    stepwise=True,
+    suppress_warnings=True,
+    error_action="ignore",
+    max_p=5,
+    max_q=5,
+    information_criterion="aic"
+)
+
 
 st.write("Selected ARIMA Model:")
 st.write(model)
@@ -221,3 +222,4 @@ st.line_chart(future_df)
 st.dataframe(future_df.head(10))
 
 st.success("Forecasting completed successfully ✅")
+
