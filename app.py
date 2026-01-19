@@ -1,4 +1,4 @@
-# app.py
+# app.py  (STABLE VERSION)
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -16,19 +16,12 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from statsmodels.tsa.stattools import adfuller
 
 
-# ----------------------------
-# Page config
-# ----------------------------
-st.set_page_config(
-    page_title="Gold Price Forecasting",
-    layout="wide"
-)
-
+st.set_page_config(page_title="Gold Price Forecasting", layout="wide")
 st.title("📈 Gold Price Forecasting using ARIMA")
 st.write("Data source: Kaggle (downloaded automatically using kagglehub)")
 
 # ----------------------------
-# Download dataset using kagglehub
+# Download dataset
 # ----------------------------
 with st.spinner("Downloading dataset from Kaggle using kagglehub..."):
     path = kagglehub.dataset_download("limbaddd/gold-price-predictions")
@@ -37,26 +30,23 @@ st.success("Dataset downloaded successfully!")
 st.write("📁 Dataset path:", path)
 
 # ----------------------------
-# Load CSV file
+# Load CSV
 # ----------------------------
 csv_files = glob.glob(os.path.join(path, "*.csv"))
-
 if not csv_files:
     st.error("No CSV file found in the dataset.")
     st.stop()
 
-csv_file = csv_files[0]
-df = pd.read_csv(csv_file)
-
+df = pd.read_csv(csv_files[0])
 st.subheader("Raw Dataset Preview")
 st.dataframe(df.head())
 
 # ----------------------------
-# Detect Date & Target columns (safer)
+# Detect columns
 # ----------------------------
 date_candidates = [c for c in df.columns if "date" in c.lower() or "time" in c.lower()]
 if not date_candidates:
-    st.error("No Date column found. Please ensure the dataset has a Date/Time column.")
+    st.error("No Date column found.")
     st.stop()
 date_col = date_candidates[0]
 
@@ -73,45 +63,31 @@ else:
 st.write(f"✅ Detected Date column: **{date_col}**")
 st.write(f"✅ Detected Price column: **{price_col}**")
 
-# Parse dates safely
+# ----------------------------
+# Parse dates + clean series
+# ----------------------------
 df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-df = df.dropna(subset=[date_col]).sort_values(date_col)
-df.set_index(date_col, inplace=True)
+df = df.dropna(subset=[date_col]).sort_values(date_col).set_index(date_col)
 
-# ----------------------------
-# Build time series + CLEANING (CRITICAL FIX)
-# ----------------------------
 ts = df[price_col].copy()
-
-# Convert strings like "1,234.56" to numeric
 if ts.dtype == "object":
     ts = ts.astype(str).str.replace(",", "", regex=False)
-
 ts = pd.to_numeric(ts, errors="coerce")
 
-# Remove invalid values
-ts = ts.replace([np.inf, -np.inf], np.nan)
-ts = ts.dropna()
-
-# Remove duplicate timestamps if any
+ts = ts.replace([np.inf, -np.inf], np.nan).dropna()
 ts = ts[~ts.index.duplicated(keep="last")]
-
-# Fill any remaining gaps (optional safety)
 ts = ts.ffill().bfill()
 
-# Final safety check
-if ts.empty or len(ts) < 30:
-    st.error("Time series is empty or too short after cleaning. Cannot proceed.")
+if ts.empty or len(ts) < 50:
+    st.error("Time series is empty or too short after cleaning.")
     st.stop()
 
-st.write(f"📌 Final cleaned series length: **{len(ts)}**")
-st.write(f"📌 Series dtype: **{ts.dtype}**")
+st.write(f"📌 Cleaned series length: **{len(ts)}**")
 
 # ----------------------------
-# Plot time series
+# Plot series
 # ----------------------------
 st.subheader("Gold Price Time Series")
-
 fig, ax = plt.subplots(figsize=(10, 4))
 ax.plot(ts, label="Gold Price")
 ax.set_title("Gold Price Over Time")
@@ -122,107 +98,105 @@ ax.legend()
 st.pyplot(fig)
 
 # ----------------------------
-# Stationarity Test (FIXED)
+# ADF test (safe)
 # ----------------------------
 st.subheader("Stationarity Test (ADF)")
-
 try:
-    adf_result = adfuller(ts.dropna())
-    adf_stat = adf_result[0]
-    p_value = adf_result[1]
-
+    adf_stat, p_value, *_ = adfuller(ts)
     st.write(f"ADF Statistic: **{adf_stat:.4f}**")
     st.write(f"p-value: **{p_value:.6f}**")
-
     if p_value < 0.05:
         st.success("Series is stationary (reject unit root at 5% level)")
     else:
         st.warning("Series is non-stationary (differencing required)")
 except Exception as e:
-    st.error("ADF test failed due to invalid series values.")
-    st.write("Error details:", str(e))
-    st.stop()
+    st.warning("ADF test could not be computed for this series.")
+    st.write(str(e))
 
 # ----------------------------
-# Train-Test Split
+# Train-test split
 # ----------------------------
 split = int(len(ts) * 0.8)
 train = ts.iloc[:split]
 test = ts.iloc[split:]
 
-if len(train) < 20 or len(test) < 5:
-    st.error("Not enough data points after split to train/test the model.")
+if len(train) < 30 or len(test) < 10:
+    st.error("Not enough data after split.")
     st.stop()
 
 # ----------------------------
-# Safe log transform (FIXED)
+# STABLE transform: log1p (requires non-negative)
+# If any negative values exist, shift once.
 # ----------------------------
 min_val = min(train.min(), test.min())
 shift = 0.0
-if min_val <= 0:
-    shift = abs(min_val) + 1e-6
-    st.warning(f"⚠️ Non-positive values detected. Applying shift of {shift:.6f} before log transform.")
+if min_val < 0:
+    shift = abs(min_val)
 
-train_log = np.log(train + shift)
-test_log = np.log(test + shift)
+train_t = np.log1p(train + shift)
+test_t  = np.log1p(test + shift)
 
 # ----------------------------
-# ARIMA Model
+# Model fit (more stable constraints)
 # ----------------------------
 st.subheader("ARIMA Model Fitting")
 
 with st.spinner("Training ARIMA model..."):
     model = auto_arima(
-        train_log,
+        train_t,
         seasonal=False,
         stepwise=True,
         suppress_warnings=True,
-        error_action="ignore"
+        error_action="ignore",
+        max_p=5, max_q=5,   # limit complexity for stability
+        max_order=10
     )
 
 st.write("Selected ARIMA Model:")
 st.write(model)
 
 # ----------------------------
-# Forecast on Test Data
+# Forecast on test (STABLE inverse transform)
+# Add clipping to avoid overflow
 # ----------------------------
-forecast_log = model.predict(n_periods=len(test_log))
-forecast = np.exp(forecast_log) - shift
+pred_t = model.predict(n_periods=len(test_t))
+pred_t = np.asarray(pred_t)
+
+# Clip transformed preds to safe range
+pred_t = np.clip(pred_t, -20, 20)
+
+forecast = np.expm1(pred_t) - shift
 forecast = pd.Series(forecast, index=test.index)
 
-# ----------------------------
-# ✅ Evaluation (FIXED: remove NaN/inf safely)
-# ----------------------------
-# Make both series finite
+# Clean forecast for metrics
+forecast = forecast.replace([np.inf, -np.inf], np.nan)
 test_clean = test.replace([np.inf, -np.inf], np.nan)
-forecast_clean = forecast.replace([np.inf, -np.inf], np.nan)
 
-# Combine and drop NaNs from either side
-eval_df = pd.concat(
-    [test_clean.rename("Actual"), forecast_clean.rename("Forecast")],
-    axis=1
-).dropna()
+eval_df = pd.concat([test_clean.rename("Actual"), forecast.rename("Forecast")], axis=1).dropna()
 
 if eval_df.empty:
-    st.error("Forecast contains invalid values (NaN/inf). Model may be unstable for this dataset.")
+    st.error("Model produced invalid forecasts again. Try reducing forecast horizon or using seasonal=False only.")
     st.stop()
 
+# ----------------------------
+# Metrics
+# ----------------------------
 mae = mean_absolute_error(eval_df["Actual"], eval_df["Forecast"])
 rmse = mean_squared_error(eval_df["Actual"], eval_df["Forecast"], squared=False)
 
 st.subheader("Model Evaluation")
-st.metric("MAE", f"{mae:.4f}")
-st.metric("RMSE", f"{rmse:.4f}")
+c1, c2 = st.columns(2)
+c1.metric("MAE", f"{mae:.4f}")
+c2.metric("RMSE", f"{rmse:.4f}")
 
 # ----------------------------
-# Plot Forecast vs Actual (use cleaned forecast for plotting)
+# Plot forecast
 # ----------------------------
 st.subheader("Forecast vs Actual")
-
 fig, ax = plt.subplots(figsize=(10, 4))
 ax.plot(train, label="Train")
 ax.plot(test, label="Test")
-ax.plot(forecast_clean.index, forecast_clean.values, label="Forecast")
+ax.plot(forecast.index, forecast.values, label="Forecast")
 ax.set_title("ARIMA Forecast")
 ax.set_xlabel("Date")
 ax.set_ylabel("Gold Price")
@@ -231,27 +205,18 @@ ax.grid(True)
 st.pyplot(fig)
 
 # ----------------------------
-# Future Forecast (also make finite)
+# Future forecast (stable)
 # ----------------------------
 st.subheader("Future Gold Price Forecast")
-
 future_days = st.slider("Select number of days to forecast", 7, 60, 30)
 
-with st.spinner("Forecasting future prices..."):
-    future_log = model.predict(n_periods=future_days)
-    future_prices = np.exp(future_log) - shift
-
+future_t = model.predict(n_periods=future_days)
+future_t = np.clip(np.asarray(future_t), -20, 20)
+future_prices = np.expm1(future_t) - shift
 future_prices = pd.Series(future_prices).replace([np.inf, -np.inf], np.nan).ffill().bfill().values
 
-future_dates = pd.date_range(
-    start=ts.index.max() + pd.Timedelta(days=1),
-    periods=future_days
-)
-
-future_df = pd.DataFrame(
-    {"Forecasted Gold Price": future_prices},
-    index=future_dates
-)
+future_dates = pd.date_range(start=ts.index.max() + pd.Timedelta(days=1), periods=future_days)
+future_df = pd.DataFrame({"Forecasted Gold Price": future_prices}, index=future_dates)
 
 st.line_chart(future_df)
 st.dataframe(future_df.head())
