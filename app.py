@@ -62,7 +62,6 @@ date_col = date_candidates[0]
 
 price_candidates = [c for c in df.columns if ("close" in c.lower()) or ("price" in c.lower())]
 if not price_candidates:
-    # fallback: pick first numeric column
     num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if not num_cols:
         st.error("No numeric price column found for forecasting.")
@@ -158,11 +157,10 @@ if len(train) < 20 or len(test) < 5:
 # ----------------------------
 # Safe log transform (FIXED)
 # ----------------------------
-# Log requires positive values. If there are zeros/negatives, shift the series.
 min_val = min(train.min(), test.min())
 shift = 0.0
 if min_val <= 0:
-    shift = abs(min_val) + 1e-6  # tiny epsilon
+    shift = abs(min_val) + 1e-6
     st.warning(f"⚠️ Non-positive values detected. Applying shift of {shift:.6f} before log transform.")
 
 train_log = np.log(train + shift)
@@ -189,30 +187,42 @@ st.write(model)
 # Forecast on Test Data
 # ----------------------------
 forecast_log = model.predict(n_periods=len(test_log))
-forecast = np.exp(forecast_log) - shift  # reverse shift
-
-# Ensure forecast aligns with test index
+forecast = np.exp(forecast_log) - shift
 forecast = pd.Series(forecast, index=test.index)
 
 # ----------------------------
-# Evaluation
+# ✅ Evaluation (FIXED: remove NaN/inf safely)
 # ----------------------------
-mae = mean_absolute_error(test, forecast)
-rmse = mean_squared_error(test, forecast, squared=False)
+# Make both series finite
+test_clean = test.replace([np.inf, -np.inf], np.nan)
+forecast_clean = forecast.replace([np.inf, -np.inf], np.nan)
+
+# Combine and drop NaNs from either side
+eval_df = pd.concat(
+    [test_clean.rename("Actual"), forecast_clean.rename("Forecast")],
+    axis=1
+).dropna()
+
+if eval_df.empty:
+    st.error("Forecast contains invalid values (NaN/inf). Model may be unstable for this dataset.")
+    st.stop()
+
+mae = mean_absolute_error(eval_df["Actual"], eval_df["Forecast"])
+rmse = mean_squared_error(eval_df["Actual"], eval_df["Forecast"], squared=False)
 
 st.subheader("Model Evaluation")
 st.metric("MAE", f"{mae:.4f}")
 st.metric("RMSE", f"{rmse:.4f}")
 
 # ----------------------------
-# Plot Forecast vs Actual
+# Plot Forecast vs Actual (use cleaned forecast for plotting)
 # ----------------------------
 st.subheader("Forecast vs Actual")
 
 fig, ax = plt.subplots(figsize=(10, 4))
 ax.plot(train, label="Train")
 ax.plot(test, label="Test")
-ax.plot(forecast.index, forecast.values, label="Forecast")
+ax.plot(forecast_clean.index, forecast_clean.values, label="Forecast")
 ax.set_title("ARIMA Forecast")
 ax.set_xlabel("Date")
 ax.set_ylabel("Gold Price")
@@ -221,7 +231,7 @@ ax.grid(True)
 st.pyplot(fig)
 
 # ----------------------------
-# Future Forecast
+# Future Forecast (also make finite)
 # ----------------------------
 st.subheader("Future Gold Price Forecast")
 
@@ -230,6 +240,8 @@ future_days = st.slider("Select number of days to forecast", 7, 60, 30)
 with st.spinner("Forecasting future prices..."):
     future_log = model.predict(n_periods=future_days)
     future_prices = np.exp(future_log) - shift
+
+future_prices = pd.Series(future_prices).replace([np.inf, -np.inf], np.nan).ffill().bfill().values
 
 future_dates = pd.date_range(
     start=ts.index.max() + pd.Timedelta(days=1),
